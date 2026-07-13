@@ -1,0 +1,13 @@
+# Core DSP dependency.
+numpy
+
+# JIT-compiles the recursive filter loops in synth.py so renders are near-instant
+# (~100x faster). Optional: without it those loops fall back to pure Python.
+numba
+
+# Optional: only needed for --play (direct playback).
+# Requires the PortAudio system library:  sudo pacman -S portaudio
+sounddevice
+
+# Desktop GUI (gui.py): parameter editing + piano-roll visualization.
+dearpygui
