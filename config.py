@@ -230,6 +230,10 @@ class VoiceConfig:
     rim_decay: float = 0.03          # rim/side-stick decay (s)
     tom_hz: float = 150.0            # tom body pitch (fills detune this per hit)
     tom_decay: float = 0.20          # tom amplitude decay (s)
+    # loudness of the tom drumroll (the descending fill). toms are a pitched sine
+    # sitting in the same low-mid band as the drone/harmony pads, so they mask
+    # easily; push this up to make the roll cut through. 1.0 = the old level.
+    tom_level: float = 2.4
 
 
 def default_voices() -> dict:

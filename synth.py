@@ -266,7 +266,9 @@ def _perc_tom(n: int, sr: int, cfg: VoiceConfig, rng, ev) -> np.ndarray:
     click = formant_filter(rng.standard_normal(n), PERC_FORMANTS["tom"], sr)
     click *= np.exp(-t / 0.006)
     env = adsr_envelope(n, sr, 0.002, cfg.tom_decay)
-    return (body + 0.4 * click) * env
+    # the click is a broadband attack transient; the pads mask the sustained sine
+    # body but not this brief front, so leaning on it lets the roll punch through.
+    return (body + 0.8 * click) * env * cfg.tom_level
 
 
 _PERC_RENDER = {

@@ -180,6 +180,10 @@ VOICE_HELP = {
               "0 = clean, higher = breathier. A number from 0 to 1.",
     "tilt_hz": "Softens the harsh, buzzy edge of the sound to make it smoother and "
                "warmer. Lower numbers = mellower; 0 turns it off.",
+    "tom_level": "How loud the descending tom drumroll (the fill) sits in the mix. "
+                 "Toms share a frequency range with the drone/harmony pads and get "
+                 "buried easily -- turn this up to make the roll cut through. 1 = the "
+                 "old level.",
 }
 
 # --------------------------------------------------------------------------- #
@@ -202,7 +206,7 @@ VOICE_FIELD_GROUPS = [
                     "kick_hz", "kick_hz_end", "kick_pitch_tau", "kick_decay",
                     "snare_tone_hz", "snare_noise", "snare_decay", "hat_decay",
                     "openhat_decay", "clap_decay", "rim_decay", "tom_hz",
-                    "tom_decay"]),
+                    "tom_decay", "tom_level"]),
 ]
 
 # Which groups each role shows. `percussion` is not a widget -- it is derived
