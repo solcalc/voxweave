@@ -183,6 +183,74 @@ VOICE_HELP = {
 }
 
 # --------------------------------------------------------------------------- #
+# Voice-editor field grouping. The editor shows only the parameters that matter
+# to the selected role; everything is organized into ordered, labeled sections.
+# --------------------------------------------------------------------------- #
+VOICE_FIELD_GROUPS = [
+    ("Core", ["vowel", "octave", "density"]),
+    ("Notes", ["walk_steps", "start_degree"]),
+    ("Drone", ["degree_pool", "change_bars_min", "change_bars_max"]),
+    ("Envelope", ["attack", "decay", "note_frac", "amp"]),
+    ("Arrangement", ["chord_lock", "beat_accent", "subdivide", "motif_len",
+                     "motif_bars", "energy_response", "answer_parity"]),
+    ("Voice character", ["vibrato_hz", "vibrato_semitones", "vibrato_delay",
+                         "vibrato_ramp", "tremolo", "scoop_semitones",
+                         "scoop_time", "jitter_cents", "shimmer", "breath",
+                         "tilt_hz"]),
+    ("Percussion", ["beat_steps", "swing", "variation", "ghost_chance",
+                    "humanize_ms", "humanize_vel", "fill_chance", "click",
+                    "kick_hz", "kick_hz_end", "kick_pitch_tau", "kick_decay",
+                    "snare_tone_hz", "snare_noise", "snare_decay", "hat_decay",
+                    "openhat_decay", "clap_decay", "rim_decay", "tom_hz",
+                    "tom_decay"]),
+]
+
+# Which groups each role shows. `percussion` is not a widget -- it is derived
+# from the role (see _on_role_changed), keeping the generator (dispatches on
+# role) and synth (dispatches on percussion) consistent.
+ROLE_FIELD_VISIBILITY = {
+    "melody":  {"Core", "Notes", "Envelope", "Arrangement", "Voice character"},
+    "harmony": {"Core", "Notes", "Envelope", "Arrangement", "Voice character"},
+    "drone":   {"Core", "Drone", "Envelope", "Arrangement", "Voice character"},
+    "beat":    {"Core", "Envelope", "Arrangement", "Percussion"},
+}
+# Field-level overrides where only a subset of a group's fields apply to a role.
+ROLE_FIELD_SUBSET = {
+    ("drone", "Arrangement"): {"chord_lock", "energy_response", "answer_parity"},
+    ("beat", "Core"): {"density"},
+    ("beat", "Envelope"): {"amp", "decay"},
+    ("beat", "Arrangement"): {"energy_response", "answer_parity", "beat_accent"},
+}
+
+
+def _visible_fields(role):
+    """Ordered [(group_label, [field_names])] the editor should show for `role`."""
+    visible = ROLE_FIELD_VISIBILITY.get(role, ROLE_FIELD_VISIBILITY["melody"])
+    out = []
+    for label, fields in VOICE_FIELD_GROUPS:
+        if label not in visible:
+            continue
+        subset = ROLE_FIELD_SUBSET.get((role, label))
+        shown = [f for f in fields if subset is None or f in subset]
+        if shown:
+            out.append((label, shown))
+    return out
+
+
+# Mini-piano: keyboard key -> (display name, scale semitone above C). Pitched
+# roles play these as C-G; the beat role maps the five keys to drum hits instead.
+_PIANO_KEYS = [("a", "C", 0), ("s", "D", 2), ("d", "E", 4), ("f", "F", 5),
+               ("g", "G", 7)]
+_PIANO_DRUMS = ["kick", "snare", "hat", "openhat", "clap"]
+# Which decay knob shapes each drum's tail (for the envelope visualization).
+_DRUM_DECAY_FIELD = ["kick_decay", "snare_decay", "hat_decay", "openhat_decay",
+                     "clap_decay"]
+
+# Parameter-shape mini-graphs shown in the editor so a layman can *see* how the
+# knobs change the sound: an amplitude envelope and a pitch (scoop+vibrato) curve.
+VIZ_W, VIZ_H, VIZ_PAD = 440, 90, 12
+
+# --------------------------------------------------------------------------- #
 # Live state.
 # --------------------------------------------------------------------------- #
 
@@ -234,6 +302,10 @@ state = {
     "next_const": None,
     "next_voice_buffers": {},
     "_roll_frame": 0,          # throttle piano-roll redraws during playback
+    # --- voice editor / mini-piano ---
+    "editing_vid": None,       # vid whose editor window currently owns the piano keys
+    "piano_oct": {},           # {vid: octave offset from C4} for the mini-piano
+    "piano_drum": {},          # {vid: last-sampled drum index} -> which envelope to draw
 }
 
 
@@ -764,6 +836,7 @@ def load_settings() -> None:
 
     voices = data.get("voices")
     if isinstance(voices, list) and voices:
+        _close_editors()                 # configs are replaced wholesale below
         state["voices"], state["voice_order"] = {}, []
         state["voice_enabled"], state["voice_vol"], state["voice_colors"] = {}, {}, {}
         state["_next_vid"] = 0
@@ -793,6 +866,7 @@ def _default_settings() -> dict:
 
 
 def on_reset_defaults() -> None:
+    _close_editors()                     # configs are replaced wholesale below
     _reset_voice_collection()
     for tag, val in _default_settings().items():
         if dpg.does_item_exist(tag):
@@ -1234,9 +1308,9 @@ def _on_rename(sender, app_data, user_data) -> None:
     if cfg is None:
         return
     cfg.name = str(app_data)
-    htag = _voice_tag(vid, "header")
-    if dpg.does_item_exist(htag):
-        dpg.configure_item(htag, label=cfg.name or "(unnamed)")
+    win = _edit_win(vid)
+    if dpg.does_item_exist(win):
+        dpg.configure_item(win, label=f"Edit: {cfg.name or '(unnamed)'}")
     if not state["playing"]:
         draw_piano_roll()  # rename shows in the legend; no re-render needed
 
@@ -1255,6 +1329,10 @@ def on_delete_voice(sender, app_data, user_data) -> None:
     vid = user_data
     _apply_voice_widgets()               # preserve edits in the surviving panels
     name = state["voices"].get(vid).name if vid in state["voices"] else vid
+    if dpg.does_item_exist(_edit_win(vid)):
+        dpg.delete_item(_edit_win(vid))  # close its editor before the voice is gone
+    if state["editing_vid"] == vid:
+        state["editing_vid"] = None
     _forget_voice(vid)
     _rebuild_voice_panels()
     _remix_current()                     # drop its audio from the live mix now
@@ -1313,8 +1391,39 @@ def _refresh_library_combo() -> None:
 
 
 # --- per-voice panel builder ------------------------------------------------
+def _add_field_widget(vid: str, fname: str, val) -> None:
+    """Add the editing widget for one VoiceConfig field into the current container.
+    Shared by the voice row's role combo and the editor window's grouped fields."""
+    tag = _voice_tag(vid, fname)
+    cb = _on_voice_param_edit          # refresh the shape graphs on any edit
+    if isinstance(val, tuple):
+        dpg.add_input_text(label=fname, default_value=repr(val), tag=tag, width=180,
+                           callback=cb, user_data=vid)
+    elif fname == "role":
+        dpg.add_combo(list(GENERATOR_ROLES), label=fname, default_value=val,
+                      tag=tag, width=180, callback=_on_role_changed, user_data=vid)
+    elif fname == "vowel":
+        dpg.add_combo(list(VOWEL_FORMANTS), label=fname, default_value=val,
+                      tag=tag, width=180, callback=cb, user_data=vid)
+    elif isinstance(val, bool):
+        dpg.add_checkbox(label=fname, default_value=val, tag=tag,
+                         callback=cb, user_data=vid)
+    elif isinstance(val, int):
+        dpg.add_input_int(label=fname, default_value=val, tag=tag, width=180, step=0,
+                          callback=cb, user_data=vid)
+    elif isinstance(val, float):
+        dpg.add_input_double(label=fname, default_value=val, tag=tag,
+                             width=180, step=0.05, format="%.3f",
+                             callback=cb, user_data=vid)
+    else:
+        dpg.add_input_text(label=fname, default_value=str(val), tag=tag, width=180,
+                           callback=cb, user_data=vid)
+    _tip(tag, VOICE_HELP.get(fname, fname))
+
+
 def _build_voice_panel(vid: str) -> None:
-    """Build one voice's control panel as a child of the 'voices_panel' group."""
+    """Build one voice's row as a child of the 'voices_panel' group. Detailed
+    parameter editing lives in a separate popup opened by the 'Edit' button."""
     cfg = state["voices"][vid]
     with dpg.group(parent="voices_panel"):
         with dpg.group(horizontal=True):
@@ -1334,36 +1443,362 @@ def _build_voice_panel(vid: str) -> None:
             _tip(_voice_tag(vid, "name"),
                  "This voice's name -- edit freely; it only relabels the voice "
                  "(shown in the piano-roll legend) and doesn't change the sound.")
+            dpg.add_button(label="Edit", width=42, callback=on_edit_voice, user_data=vid)
+            _tip(dpg.last_item(),
+                 "Open this voice's editor: role-specific parameters plus a mini "
+                 "piano to audition how it sounds.")
             dpg.add_button(label="Save", width=42, callback=on_save_voice, user_data=vid)
             _tip(dpg.last_item(), "Save this voice to the reusable library (voices/).")
             dpg.add_button(label="Del", width=38, callback=on_delete_voice, user_data=vid)
             _tip(dpg.last_item(), "Remove this voice from the session.")
-        with dpg.collapsing_header(label=cfg.name or "(unnamed)",
-                                   tag=_voice_tag(vid, "header")):
-            for f in dataclasses.fields(VoiceConfig):
-                if f.name == "name":
-                    continue
-                val = getattr(cfg, f.name)
-                tag = _voice_tag(vid, f.name)
-                if isinstance(val, tuple):
-                    dpg.add_input_text(label=f.name, default_value=repr(val), tag=tag, width=180)
-                elif f.name == "role":
-                    dpg.add_combo(list(GENERATOR_ROLES), label=f.name, default_value=val,
-                                  tag=tag, width=180)
-                elif f.name == "vowel":
-                    dpg.add_combo(list(VOWEL_FORMANTS), label=f.name, default_value=val,
-                                  tag=tag, width=180)
-                elif isinstance(val, bool):
-                    dpg.add_checkbox(label=f.name, default_value=val, tag=tag)
-                elif isinstance(val, int):
-                    dpg.add_input_int(label=f.name, default_value=val, tag=tag, width=180, step=0)
-                elif isinstance(val, float):
-                    dpg.add_input_double(label=f.name, default_value=val, tag=tag,
-                                         width=180, step=0.05, format="%.3f")
-                else:
-                    dpg.add_input_text(label=f.name, default_value=str(val), tag=tag, width=180)
-                _tip(tag, VOICE_HELP.get(f.name, f.name))
         dpg.add_separator()
+
+
+# --- voice editor window ----------------------------------------------------
+def _edit_win(vid: str) -> str:
+    return f"edit_win_{vid}"
+
+
+def _build_editor_fields(vid: str) -> None:
+    """(Re)build the role-filtered parameter widgets inside the editor's field
+    container. Called on open and whenever the role changes."""
+    cfg = state["voices"][vid]
+    dpg.push_container_stack(f"edit_fields_{vid}")
+    try:
+        for label, fields in _visible_fields(cfg.role):
+            dpg.add_text(label)
+            for fname in fields:
+                _add_field_widget(vid, fname, getattr(cfg, fname))
+            dpg.add_separator()
+    finally:
+        dpg.pop_container_stack()
+
+
+def on_edit_voice(sender, app_data, user_data) -> None:
+    """Open (or focus) the popup editor for a voice."""
+    vid = user_data
+    win = _edit_win(vid)
+    if dpg.does_item_exist(win):
+        dpg.focus_item(win)
+        state["editing_vid"] = vid
+        return
+    cfg = state["voices"][vid]
+    state["piano_oct"].setdefault(vid, 0)
+    with dpg.window(label=f"Edit: {cfg.name}", tag=win, width=470, height=680,
+                    pos=(430, 30), on_close=_on_editor_close, user_data=vid):
+        _add_field_widget(vid, "role", cfg.role)
+        dpg.add_group(tag=f"viz_box_{vid}")   # amplitude + pitch shape graphs
+        _build_voice_viz(vid)
+        dpg.add_separator()
+        # Fields scroll in their own box that fills the window down to ~140px from
+        # the bottom -- so resizing taller gives more editing room while the piano
+        # block stays pinned to the bottom. (Negative height = reserve that margin.)
+        dpg.add_child_window(tag=f"edit_fields_{vid}", width=-1, height=-140)
+        _build_editor_fields(vid)
+        dpg.add_separator()
+        _build_piano(vid)
+    state["editing_vid"] = vid
+
+
+def _on_editor_close(sender, app_data, user_data) -> None:
+    """Capture final edits into the config before the widgets are torn down."""
+    vid = user_data
+    _apply_voice_widgets()
+    if state["editing_vid"] == vid:
+        state["editing_vid"] = None
+    if dpg.does_item_exist(_edit_win(vid)):
+        dpg.delete_item(_edit_win(vid))
+
+
+def _on_role_changed(sender, app_data, user_data) -> None:
+    """Role picked in the editor: re-derive percussion and rebuild the visible
+    parameter set for the new role (hidden fields keep their config values)."""
+    vid = user_data
+    _apply_voice_widgets()
+    cfg = state["voices"][vid]
+    cfg.role = app_data
+    cfg.percussion = (app_data == "beat")
+    fields_tag = f"edit_fields_{vid}"
+    if dpg.does_item_exist(fields_tag):
+        dpg.delete_item(fields_tag, children_only=True)
+        _build_editor_fields(vid)
+    viz_tag = f"viz_box_{vid}"
+    if dpg.does_item_exist(viz_tag):        # pitch graph appears only for pitched roles
+        dpg.delete_item(viz_tag, children_only=True)
+        _build_voice_viz(vid)
+    _update_piano_label(vid)
+
+
+# --- mini piano + independent note preview ----------------------------------
+def _octave_label(vid: str) -> str:
+    return f"C{4 + state['piano_oct'].get(vid, 0)}"
+
+
+def _update_piano_label(vid: str) -> None:
+    tag = f"piano_octlbl_{vid}"
+    if dpg.does_item_exist(tag):
+        dpg.set_value(tag, _octave_label(vid))
+
+
+# --- parameter-shape visualizations -----------------------------------------
+def _viz_get(vid: str, fname: str, default: float) -> float:
+    """Current numeric value of a field -- from its live widget if the editor is
+    open, else the stored config -- so the graphs track edits before Generate."""
+    tag = _voice_tag(vid, fname)
+    if dpg.does_item_exist(tag):
+        try:
+            return float(dpg.get_value(tag))
+        except (TypeError, ValueError):
+            return default
+    return float(getattr(state["voices"].get(vid, None), fname, default))
+
+
+def _build_voice_viz(vid: str) -> None:
+    """(Re)build the graph area for a voice: an amplitude envelope always, plus a
+    pitch curve for pitched roles (a drone/melody/harmony -- not the beatbox)."""
+    parent = f"viz_box_{vid}"
+    beat = (state["voices"][vid].role == "beat")
+    dpg.push_container_stack(parent)
+    try:
+        lbl = "Drum-hit shape (loudness over time)" if beat else \
+              "Note shape -- loudness over time (swell in / hold / fade out)"
+        dpg.add_text(lbl, tag=f"viz_envlbl_{vid}")
+        with dpg.drawlist(width=VIZ_W, height=VIZ_H, tag=f"viz_env_{vid}"):
+            pass
+        if not beat:
+            dpg.add_text("Pitch -- scoop up into the note, then vibrato wobble")
+            with dpg.drawlist(width=VIZ_W, height=VIZ_H, tag=f"viz_pitch_{vid}"):
+                pass
+    finally:
+        dpg.pop_container_stack()
+    _redraw_voice_viz(vid)
+
+
+def _redraw_voice_viz(vid: str) -> None:
+    if dpg.does_item_exist(f"viz_env_{vid}"):
+        _draw_envelope(vid)
+    if dpg.does_item_exist(f"viz_pitch_{vid}"):
+        _draw_pitch(vid)
+
+
+_VIZ_AXIS = (90, 90, 90)
+_VIZ_ENV_COLOR = (120, 200, 255)
+_VIZ_PITCH_COLOR = (255, 185, 90)
+
+
+def _draw_envelope(vid: str) -> None:
+    """Loudness of a single note over time. Shape only (a representative slot);
+    the point is relative feel -- taller = louder, longer tail = longer decay."""
+    tag = f"viz_env_{vid}"
+    dpg.delete_item(tag, children_only=True)
+    beat = (state["voices"][vid].role == "beat")
+    x0, x1, ybot, ytop = VIZ_PAD, VIZ_W - VIZ_PAD, VIZ_H - VIZ_PAD, VIZ_PAD
+    if beat:
+        idx = state["piano_drum"].get(vid, 0)
+        attack, hold = 0.002, 0.0
+        decay = max(_viz_get(vid, _DRUM_DECAY_FIELD[idx], 0.15), 1e-3)
+        dpg.set_value(f"viz_envlbl_{vid}",
+                      f"Drum-hit shape: {_PIANO_DRUMS[idx]} (loudness over time)")
+    else:
+        attack = max(_viz_get(vid, "attack", 0.02), 1e-4)
+        hold = max(_viz_get(vid, "note_frac", 0.9), 0.0) * 1.0  # 1s representative slot
+        decay = max(_viz_get(vid, "decay", 2.5), 1e-3)
+    amp = max(0.0, min(_viz_get(vid, "amp", 0.9), 1.0))
+    total = attack + hold + decay
+    n = 140
+    pts = []
+    for i in range(n):
+        t = total * i / (n - 1)
+        if t < attack:
+            e = 1.0 - math.exp(-3.0 * t / attack)
+        elif t < attack + hold:
+            e = 1.0
+        else:
+            e = math.exp(-3.0 * (t - attack - hold) / decay)
+        x = x0 + (t / total) * (x1 - x0)
+        y = ybot - (e * amp) * (ybot - ytop)
+        pts.append([x, y])
+    dpg.draw_line([x0, ybot], [x1, ybot], color=_VIZ_AXIS, parent=tag)
+    dpg.draw_line([x0, ybot], [x0, ytop], color=_VIZ_AXIS, parent=tag)
+    dpg.draw_polyline(pts, color=_VIZ_ENV_COLOR, thickness=2, parent=tag)
+
+
+def _draw_pitch(vid: str) -> None:
+    """Pitch relative to the target note: a scoop up at the onset, then vibrato
+    wobble that eases in. The flat grey line is 'in tune' (the target pitch)."""
+    tag = f"viz_pitch_{vid}"
+    dpg.delete_item(tag, children_only=True)
+    scoop = _viz_get(vid, "scoop_semitones", 0.4)
+    stime = max(_viz_get(vid, "scoop_time", 0.07), 1e-3)
+    vhz = _viz_get(vid, "vibrato_hz", 5.5)
+    vsemi = _viz_get(vid, "vibrato_semitones", 0.35)
+    vdelay = _viz_get(vid, "vibrato_delay", 0.35)
+    vramp = max(_viz_get(vid, "vibrato_ramp", 0.6), 1e-3)
+    x0, x1, ymid = VIZ_PAD, VIZ_W - VIZ_PAD, VIZ_H / 2.0
+    span = max(scoop, vsemi, 0.5) * 1.15
+    T, n = 1.4, 240
+    pts = []
+    for i in range(n):
+        t = T * i / (n - 1)
+        s = -scoop * math.exp(-t / stime)
+        if t > vdelay:
+            dep = vsemi * min((t - vdelay) / vramp, 1.0)
+            v = dep * math.sin(2.0 * math.pi * vhz * (t - vdelay))
+        else:
+            v = 0.0
+        x = x0 + (t / T) * (x1 - x0)
+        y = ymid - ((s + v) / span) * (ymid - VIZ_PAD)
+        pts.append([x, y])
+    dpg.draw_line([x0, ymid], [x1, ymid], color=_VIZ_AXIS, parent=tag)
+    dpg.draw_polyline(pts, color=_VIZ_PITCH_COLOR, thickness=2, parent=tag)
+
+
+def _on_voice_param_edit(sender, app_data, user_data) -> None:
+    """Any editor knob changed: refresh this voice's shape graphs live."""
+    _redraw_voice_viz(user_data)
+
+
+def _build_piano(vid: str) -> None:
+    cfg = state["voices"][vid]
+    beat = (cfg.role == "beat")
+    dpg.add_text("Sample this voice -- keys: a s d f g")
+    with dpg.group(horizontal=True):
+        for i, (key, name, _semi) in enumerate(_PIANO_KEYS):
+            cap = _PIANO_DRUMS[i] if beat else name
+            dpg.add_button(label=f"{cap}\n({key})", width=54, height=44,
+                           callback=_on_piano_button, user_data=(vid, i))
+    with dpg.group(horizontal=True):
+        dpg.add_button(label=" - ", callback=_on_octave, user_data=(vid, -1))
+        _tip(dpg.last_item(), "Drop the piano an octave.")
+        dpg.add_text(_octave_label(vid), tag=f"piano_octlbl_{vid}")
+        dpg.add_button(label=" + ", callback=_on_octave, user_data=(vid, 1))
+        _tip(dpg.last_item(), "Raise the piano an octave.")
+        dpg.add_text("  (octave -- ignored for beat voices)")
+
+
+def _on_octave(sender, app_data, user_data) -> None:
+    vid, delta = user_data
+    o = max(-3, min(3, state["piano_oct"].get(vid, 0) + delta))
+    state["piano_oct"][vid] = o
+    _update_piano_label(vid)
+
+
+def _on_piano_button(sender, app_data, user_data) -> None:
+    vid, idx = user_data
+    _preview_note(vid, idx)
+
+
+def _preview_note(vid: str, idx: int) -> None:
+    """Render a single note (or drum hit) for this voice with its current, unsaved
+    edits and play it on an independent channel over whatever else is playing."""
+    if not _SD_AVAILABLE:
+        _status("preview unavailable (sounddevice not installed)")
+        return
+    if vid not in state["voices"]:
+        return
+    try:
+        _apply_voice_widgets()
+        const = _read_const()
+    except (ValueError, SyntaxError) as exc:
+        _status(f"invalid parameter: {exc}")
+        return
+    cfg = state["voices"][vid]
+    if cfg.percussion:
+        state["piano_drum"][vid] = idx      # graph the drum we're auditioning
+        _redraw_voice_viz(vid)
+        ev = generator.NoteEvent(midi=60, start=0.0, duration=0.5,
+                                 voice=cfg.name, sound=_PIANO_DRUMS[idx])
+    else:
+        midi = 60 + 12 * state["piano_oct"].get(vid, 0) + _PIANO_KEYS[idx][2]
+        dur = max(1.0, cfg.attack + 0.6 + cfg.decay)
+        ev = generator.NoteEvent(midi=midi, start=0.0, duration=dur,
+                                 voice=cfg.name, velocity=1.0)
+    try:
+        # render_events pads to the whole session length; the note lives at the
+        # front, so trim to it (plus a hair) instead of playing minutes of silence.
+        buf = synth.render_events([ev], const, cfg)
+        n = min(len(buf), int(ev.duration * const.sample_rate) + 1)
+        sd.play(np.asarray(buf[:n], dtype=np.float32), const.sample_rate)
+    except Exception as exc:
+        _status(f"preview error: {exc}")
+
+
+def _active_editor_vid():
+    """The vid of the editor that should receive piano keystrokes, or None. Keys
+    only act while an editor window is open (so typing elsewhere is unaffected)."""
+    vid = state["editing_vid"]
+    if vid is None or vid not in state["voices"]:
+        return None
+    if not dpg.does_item_exist(_edit_win(vid)):
+        state["editing_vid"] = None
+        return None
+    return vid
+
+
+_PIANO_KEY_INDEX = {key: i for i, (key, _n, _s) in enumerate(_PIANO_KEYS)}
+
+# Item types that consume typing -- while one of these is focused the piano keys
+# must not fire (e.g. a '-' typed into walk_steps shouldn't shift the octave).
+_TEXT_INPUT_TYPES = ("InputText", "InputInt", "InputDouble", "InputFloat", "Combo")
+
+
+def _text_input_focused() -> bool:
+    item = dpg.get_focused_item()
+    if not item:
+        return False
+    try:
+        t = dpg.get_item_type(item)
+    except Exception:
+        return False
+    return any(k in t for k in _TEXT_INPUT_TYPES)
+
+
+def _on_piano_key(sender, app_data, user_data) -> None:
+    if _text_input_focused():
+        return
+    vid = _active_editor_vid()
+    if vid is not None:
+        _preview_note(vid, _PIANO_KEY_INDEX[user_data])
+
+
+def _on_piano_octkey(sender, app_data, user_data) -> None:
+    if _text_input_focused():
+        return
+    vid = _active_editor_vid()
+    if vid is not None:
+        _on_octave(None, None, (vid, user_data))
+
+
+def _register_piano_keys() -> None:
+    """Global key handlers driving the mini-piano of the focused editor window."""
+    with dpg.handler_registry():
+        for key, _name, _semi in _PIANO_KEYS:
+            k = getattr(dpg, f"mvKey_{key.upper()}", None)
+            if k is not None:
+                dpg.add_key_press_handler(k, callback=_on_piano_key, user_data=key)
+        for name in ("mvKey_Minus", "mvKey_Subtract"):
+            k = getattr(dpg, name, None)
+            if k is not None:
+                dpg.add_key_press_handler(k, callback=_on_piano_octkey, user_data=-1)
+        for name in ("mvKey_Plus", "mvKey_Add"):
+            k = getattr(dpg, name, None)
+            if k is not None:
+                dpg.add_key_press_handler(k, callback=_on_piano_octkey, user_data=1)
+
+
+def _close_editors(keep=None) -> None:
+    """Close editor windows. With keep=set(vids), only those whose voice is absent
+    are closed (used on add/delete); with keep=None, close every editor (used when
+    the whole collection is replaced by reset/load, which reuses vids for new
+    configs, so open editors would show stale widgets)."""
+    for alias in list(dpg.get_aliases()):
+        if not alias.startswith("edit_win_"):
+            continue
+        vid = alias[len("edit_win_"):]
+        if (keep is None or vid not in keep) and dpg.does_item_exist(alias):
+            dpg.delete_item(alias)
+    if keep is None or state["editing_vid"] not in keep:
+        state["editing_vid"] = None
 
 
 def _rebuild_voice_panels() -> None:
@@ -1371,12 +1806,14 @@ def _rebuild_voice_panels() -> None:
     State is the source of truth; widgets are recreated from it."""
     if not dpg.does_item_exist("voices_panel"):
         return
+    _close_editors(keep=set(_vids()))
     dpg.delete_item("voices_panel", children_only=True)
     for vid in _vids():
         _build_voice_panel(vid)
 
 
 def build_ui() -> None:
+    _register_piano_keys()
     with dpg.window(tag="primary"):
         with dpg.group(horizontal=True):
             # left: controls

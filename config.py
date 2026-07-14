@@ -30,6 +30,15 @@ VOWEL_FORMANTS = {
         (870.0, 8.0, 0.40),
         (2240.0, 12.0, 0.15),
     ],
+    # Male "ee" (as in "me") for the opera warm-up voice. Same vowel as "ee" but
+    # voiced by a longer (male) vocal tract, so the formants sit lower and chestier
+    # than the bright default "ee". The boosted F3 near ~2.9 kHz is the opera
+    # "singer's formant" -- the ringing resonance that lets a trained voice project.
+    "ee_m": [
+        (270.0, 7.0, 1.00),   # F1: low, focused
+        (1990.0, 9.0, 0.45),  # F2: lower than female "ee" -> reads as male
+        (2900.0, 12.0, 0.50), # F3: singer's-formant ring, gain-boosted for projection
+    ],
 }
 
 
@@ -254,6 +263,27 @@ def default_voices() -> dict:
             # foundation: tracks the chord root directly, never subdivides or
             # rests, and always sounds (answer_parity=-1)
             chord_lock=1.0, subdivide=0.0, energy_response=0.25, answer_parity=-1,
+        ),
+        "opera": VoiceConfig(
+            # A male opera singer practicing: slow, deliberate "meeee" lines with
+            # big blooming vibrato and an expressive swoop into each note. Uses the
+            # melody algorithm (a foreground solo line); the operatic character is
+            # all timbre + vibrato + register, not a special note pattern.
+            name="opera", role="melody", vowel="ee_m", octave=0, density=0.4,
+            walk_steps=(-2, -1, 1, 2), start_degree=0,
+            # gentle vocal onset, long sustain on the held note, notes sung legato
+            attack=0.10, decay=3.0, note_frac=0.95, amp=0.9,
+            # operatic vibrato: wide, and blooms in a moment after the note settles
+            vibrato_hz=5.5, vibrato_semitones=0.6, vibrato_delay=0.5, vibrato_ramp=0.9,
+            tremolo=0.15,
+            # expressive portamento swoop up into each pitch
+            scoop_semitones=0.6, scoop_time=0.10,
+            # mostly full-voiced with a touch of air; warm/chesty tone (lower tilt)
+            breath=0.05, shimmer=0.05, jitter_cents=10.0, tilt_hz=2600.0,
+            # deliberate: fairly chord-locked, calm rhythm, some motif repetition,
+            # and always sounds (a soloist practicing, not trading phrases)
+            chord_lock=0.7, subdivide=0.15, motif_len=4, motif_bars=2,
+            energy_response=0.6, answer_parity=-1,
         ),
         "beat": VoiceConfig(
             name="beat", role="beat", vowel="oo", octave=0, density=1.0,
