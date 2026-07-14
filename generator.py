@@ -349,12 +349,19 @@ _GENERATORS = {
     "beat": generate_percussion,
 }
 
+# Public list of selectable roles (the generation algorithms a voice can use).
+GENERATOR_ROLES = tuple(_GENERATORS)
+
 
 def generate_voice(const: SessionConstitution, cfg: VoiceConfig, arr=None):
-    """Generate events for a single named voice, building an arrangement if none."""
+    """Generate events for a single voice, building an arrangement if none.
+
+    Dispatch is on `cfg.role` (the algorithm), not `cfg.name` (a free-form label),
+    so voices can be renamed/added without changing how their notes are produced.
+    """
     if arr is None:
         arr = build_arrangement(const)
-    return _GENERATORS[cfg.name](const, cfg, arr)
+    return _GENERATORS.get(cfg.role, generate_melody)(const, cfg, arr)
 
 
 def generate_session(const: SessionConstitution, voices: dict, arr=None):

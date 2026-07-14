@@ -13,5 +13,8 @@ output/
 output_flat/
 *.wav
 
+# Saved voice library (user data)
+voices/
+
 # OS / editor
 .DS_Store

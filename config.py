@@ -129,6 +129,11 @@ class VoiceConfig:
     vowel: str
     octave: int              # register offset (+ = higher)
     density: float           # 0..1 probability a slot plays vs rests
+    # Which generation algorithm drives this voice. `name` is a free-form label
+    # (editable, shown in the UI); `role` is what the generator dispatches on, so
+    # renaming a voice or adding new ones never changes how notes are produced.
+    # One of the keys in generator._GENERATORS: melody | harmony | drone | beat.
+    role: str = "melody"
     # allowed random-walk steps in scale degrees
     walk_steps: tuple = (-2, -1, 1, 2)
     # where the walk begins, in scale degrees relative to the base register
@@ -222,7 +227,7 @@ def default_voices() -> dict:
     """The three established dolls: melody=ee upper, harmony=oh mid, drone=oo low."""
     return {
         "melody": VoiceConfig(
-            name="melody", vowel="ee", octave=1, density=0.55,
+            name="melody", role="melody", vowel="ee", octave=1, density=0.55,
             walk_steps=(-2, -1, 1, 2), attack=0.06, decay=1.8, note_frac=0.8,
             vibrato_hz=5.7, vibrato_semitones=0.4, scoop_semitones=0.5,
             # lead line: loosely chord-locked (room to roam), lively subdivisions,
@@ -231,7 +236,7 @@ def default_voices() -> dict:
             energy_response=0.7, answer_parity=1,
         ),
         "harmony": VoiceConfig(
-            name="harmony", vowel="oh", octave=0, density=0.35, start_degree=2,
+            name="harmony", role="harmony", vowel="oh", octave=0, density=0.35, start_degree=2,
             attack=0.08, decay=2.5, note_frac=0.9,
             vibrato_hz=5.2, vibrato_semitones=0.3,
             # inner voice: tightly chord-locked, calmer rhythm, answers on even
@@ -240,7 +245,7 @@ def default_voices() -> dict:
             energy_response=0.5, answer_parity=0,
         ),
         "drone": VoiceConfig(
-            name="drone", vowel="oo", octave=-1, density=1.0,
+            name="drone", role="drone", vowel="oo", octave=-1, density=1.0,
             degree_pool=(0, 3, 4), change_bars_min=8, change_bars_max=16,
             attack=0.4, decay=6.0, note_frac=1.0, amp=0.7,
             # a drone breathes slowly: gentle, slow vibrato, no scoop, more air
@@ -251,7 +256,7 @@ def default_voices() -> dict:
             chord_lock=1.0, subdivide=0.0, energy_response=0.25, answer_parity=-1,
         ),
         "beat": VoiceConfig(
-            name="beat", vowel="oo", octave=0, density=1.0,
+            name="beat", role="beat", vowel="oo", octave=0, density=1.0,
             # a beatboxer: unpitched vocal drum hits on the grid. vowel/octave are
             # inert here (percussion path). decay=0 keeps the piano-roll blocks tight.
             percussion=True, amp=0.85, decay=0.0,

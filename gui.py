@@ -16,10 +16,12 @@ the piece ends.
 
 import ast
 import dataclasses
+import glob
 import json
 import math
 import os
 import random
+import re
 import threading
 import time
 
@@ -31,6 +33,7 @@ import synth
 import wav_io
 from arrangement import build_arrangement, flat_arrangement
 from config import SessionConstitution, VoiceConfig, VOWEL_FORMANTS, default_voices
+from generator import GENERATOR_ROLES
 from scales import NOTE_CLASS, SCALES
 
 try:
@@ -39,19 +42,36 @@ try:
 except Exception:
     _SD_AVAILABLE = False
 
-VOICE_NAMES = ("melody", "harmony", "drone", "beat")
-VOICE_COLORS = {
-    "melody": (90, 185, 255),
-    "harmony": (255, 185, 90),
-    "drone": (150, 235, 150),
-    "beat": (235, 120, 200),
-}
+# Voices are identified by a stable, immutable id (vid) used for widget tags and
+# dict keys. The human-facing `name` is just a mutable label, so renaming a voice
+# never disturbs tags/state. The default set maps onto vid0..vid3 in build order.
+VOICE_PALETTE = (
+    (90, 185, 255),   # blue
+    (255, 185, 90),   # amber
+    (150, 235, 150),  # green
+    (235, 120, 200),  # pink
+    (255, 140, 120),  # coral
+    (140, 200, 255),  # sky
+    (210, 210, 120),  # olive
+    (180, 140, 240),  # violet
+)
 
 CANVAS_W = 1400
 CANVAS_H = 560
 MARGIN = 40
 
-SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_settings.json")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_PATH = os.path.join(_HERE, "gui_settings.json")
+VOICES_DIR = os.path.join(_HERE, "voices")
+
+
+def _vids() -> list:
+    """Current voices in display order (list of stable ids)."""
+    return list(state["voice_order"])
+
+
+def _color_for(vid: str) -> tuple:
+    return state["voice_colors"].get(vid, (200, 200, 200))
 
 # How long after the last param tweak before a live re-render fires (seconds).
 LIVE_DEBOUNCE_SEC = 0.6
@@ -91,6 +111,10 @@ SESSION_HELP = {
 VOICE_ENABLED_HELP = "Turn this voice on or off. When off, you won't hear it at all. On/off."
 
 VOICE_HELP = {
+    "role": "The kind of part this voice plays, which picks how its notes are written: "
+            "'melody' (a roaming lead line), 'harmony' (a calmer inner part), 'drone' (a "
+            "sustained low foundation), or 'beat' (vocal drum hits -- pair with the "
+            "'percussion' box). Changing this takes full effect on the next Generate.",
     "vowel": "Which vowel this voice 'sings' (like 'eee', 'oh', or 'oo'), which changes "
              "its character. Pick one from the list.",
     "octave": "How high or low this voice sits. 0 is its normal spot; +1 jumps it up "
@@ -168,7 +192,12 @@ VOICE_HELP = {
 _buf_lock = threading.Lock()
 
 state = {
-    "voices": default_voices(),
+    # --- voice collection (stable-id keyed; see VOICE_PALETTE note above) ---
+    "voices": {},              # {vid: VoiceConfig}
+    "voice_order": [],         # [vid, ...] display order
+    "voice_colors": {},        # {vid: (r,g,b)}
+    "voice_enabled": {},       # {vid: bool}   mirror of the enabled checkboxes
+    "_next_vid": 0,            # monotonic counter for minting new vids
     "const": None,
     "events": {},
     "mixed": None,
@@ -191,7 +220,7 @@ state = {
     "next_tail_merged": False, # has the current decay tail been overlap-added into next?
     # --- volume ---
     "master_vol": 1.0,         # applied as a real-time gain in the audio callback
-    "voice_vol": {n: 1.0 for n in VOICE_NAMES},  # per-voice gains applied at mix time
+    "voice_vol": {},           # {vid: gain} per-voice gains applied at mix time
     # --- live mode ---
     "live_mode": False,
     "param_snapshot": None,    # widget-value dict at last regen (change baseline)
@@ -209,6 +238,117 @@ state = {
 
 
 # --------------------------------------------------------------------------- #
+# Voice collection management (add / remove / (de)serialize).
+# --------------------------------------------------------------------------- #
+def _mint_vid() -> str:
+    vid = f"vid{state['_next_vid']}"
+    state["_next_vid"] += 1
+    return vid
+
+
+def _register_voice(cfg: VoiceConfig, vid: str | None = None, *,
+                    enabled: bool = True, vol: float = 1.0,
+                    color: tuple | None = None) -> str:
+    """Insert a voice into the collection and return its (possibly new) vid."""
+    if vid is None:
+        vid = _mint_vid()
+    state["voices"][vid] = cfg
+    state["voice_order"].append(vid)
+    state["voice_enabled"][vid] = enabled
+    state["voice_vol"][vid] = vol
+    state["voice_colors"][vid] = color or VOICE_PALETTE[
+        (len(state["voice_order"]) - 1) % len(VOICE_PALETTE)]
+    return vid
+
+
+def _forget_voice(vid: str) -> None:
+    """Remove a voice and all of its per-vid state."""
+    for d in ("voices", "voice_enabled", "voice_vol", "voice_colors"):
+        state[d].pop(vid, None)
+    if vid in state["voice_order"]:
+        state["voice_order"].remove(vid)
+    state["events"].pop(vid, None)
+    state["voice_buffers"].pop(vid, None)
+
+
+def _reset_voice_collection() -> None:
+    """Rebuild the collection from the four factory-default dolls."""
+    state["voices"], state["voice_order"] = {}, []
+    state["voice_enabled"], state["voice_vol"], state["voice_colors"] = {}, {}, {}
+    state["_next_vid"] = 0
+    for cfg in default_voices().values():
+        _register_voice(cfg)
+
+
+def _unique_name(name: str) -> str:
+    """Disambiguate against current voice names (the generator's per-voice PRNG is
+    keyed on name, so identical names would render identically)."""
+    existing = {state["voices"][v].name for v in state["voice_order"]}
+    if name not in existing:
+        return name
+    i = 2
+    while f"{name} {i}" in existing:
+        i += 1
+    return f"{name} {i}"
+
+
+def _new_blank_voice() -> VoiceConfig:
+    """A sensible fresh sung voice for the 'Add Voice' button."""
+    n = len(state["voice_order"]) + 1
+    return VoiceConfig(name=_unique_name(f"voice{n}"), vowel="oo", octave=0, density=0.4)
+
+
+# --------------------------------------------------------------------------- #
+# Voice (de)serialization + on-disk library (voices/*.json).
+# --------------------------------------------------------------------------- #
+def _voice_to_dict(cfg: VoiceConfig) -> dict:
+    """Plain-JSON dict of a VoiceConfig (tuples become lists via asdict)."""
+    return dataclasses.asdict(cfg)
+
+
+def _voice_from_dict(d: dict) -> VoiceConfig:
+    """Rebuild a VoiceConfig, coercing each field to its declared type."""
+    cfg = VoiceConfig(
+        name=str(d.get("name", "voice")),
+        vowel=str(d.get("vowel", "oo")),
+        octave=int(d.get("octave", 0)),
+        density=float(d.get("density", 0.4)),
+    )
+    for f in dataclasses.fields(VoiceConfig):
+        if f.name in ("name", "vowel", "octave", "density") or f.name not in d:
+            continue
+        cur, val = getattr(cfg, f.name), d[f.name]
+        if isinstance(cur, tuple):
+            setattr(cfg, f.name, tuple(val))
+        elif isinstance(cur, bool):
+            setattr(cfg, f.name, bool(val))
+        elif isinstance(cur, int):
+            setattr(cfg, f.name, int(val))
+        elif isinstance(cur, float):
+            setattr(cfg, f.name, float(val))
+        else:
+            setattr(cfg, f.name, val)
+    return cfg
+
+
+def _library_path(name: str) -> str:
+    slug = re.sub(r"[^0-9A-Za-z._-]+", "_", name.strip()) or "voice"
+    return os.path.join(VOICES_DIR, f"{slug}.json")
+
+
+def library_voices() -> list:
+    """Names (filename stems) of voices saved in the library, sorted."""
+    if not os.path.isdir(VOICES_DIR):
+        return []
+    return sorted(os.path.splitext(os.path.basename(p))[0]
+                  for p in glob.glob(os.path.join(VOICES_DIR, "*.json")))
+
+
+# Populate the default collection at import time so the UI can build from it.
+_reset_voice_collection()
+
+
+# --------------------------------------------------------------------------- #
 # Flatten: zero the structural knobs (parity with testbed.py --flat).
 # --------------------------------------------------------------------------- #
 def _flatten_voice(cfg: VoiceConfig) -> None:
@@ -223,12 +363,16 @@ def _flatten_voice(cfg: VoiceConfig) -> None:
 # --------------------------------------------------------------------------- #
 # Widget tag helpers.
 # --------------------------------------------------------------------------- #
-def _voice_tag(name: str, field: str) -> str:
-    return f"v_{name}_{field}"
+def _voice_tag(vid: str, field: str) -> str:
+    return f"v_{vid}_{field}"
 
 
-def _enabled_tag(name: str) -> str:
-    return f"v_{name}_enabled"
+def _enabled_tag(vid: str) -> str:
+    return f"v_{vid}_enabled"
+
+
+def _vol_tag(vid: str) -> str:
+    return f"vol_{vid}"
 
 
 def _status(msg: str) -> None:
@@ -248,13 +392,20 @@ def _read_const() -> SessionConstitution:
 
 
 def _apply_voice_widgets() -> None:
-    """Push every voice widget value back into its VoiceConfig object."""
-    for name in VOICE_NAMES:
-        cfg = state["voices"][name]
+    """Push every voice widget value back into its VoiceConfig object.
+
+    `name` is handled live by _on_rename (its widget is a plain label editor, not
+    a config knob), so it is skipped here along with any voice whose widgets have
+    been torn down mid-rebuild."""
+    for vid in _vids():
+        cfg = state["voices"][vid]
         for f in dataclasses.fields(VoiceConfig):
             if f.name == "name":
                 continue
-            raw = dpg.get_value(_voice_tag(name, f.name))
+            tag = _voice_tag(vid, f.name)
+            if not dpg.does_item_exist(tag):
+                continue
+            raw = dpg.get_value(tag)
             cur = getattr(cfg, f.name)
             if isinstance(cur, tuple):
                 parsed = ast.literal_eval(raw)
@@ -281,17 +432,17 @@ def _generate_worker(const, flat, enabled) -> None:
         steps = len(enabled) + 1
         state["gen_progress"] = 1.0 / steps
         events, voice_buffers, buffers = {}, {}, []
-        for i, (name, cfg) in enumerate(enabled):
+        for i, (vid, cfg) in enumerate(enabled):
             if state["gen_cancel"]:
                 state["gen_status"] = "cancelled"
                 state["gen_running"] = False
                 return
-            state["gen_status"] = f"rendering {name}..."
+            state["gen_status"] = f"rendering {cfg.name}..."
             evs = generator.generate_voice(const, cfg, arr)
-            events[name] = evs
+            events[vid] = evs
             buf = synth.render_events(evs, const, cfg)
-            voice_buffers[name] = buf   # store unscaled; per-voice gain applied at mix
-            buffers.append(buf * state["voice_vol"].get(name, 1.0))
+            voice_buffers[vid] = buf   # store unscaled; per-voice gain applied at mix
+            buffers.append(buf * state["voice_vol"].get(vid, 1.0))
             state["gen_progress"] = (i + 2) / steps
         mixed = synth.mix(buffers) if buffers else None
         state["gen_result"] = (const, events, voice_buffers, mixed)
@@ -315,13 +466,13 @@ def on_generate() -> None:
 
     flat = dpg.get_value("session_flat")
     enabled = []
-    for name in VOICE_NAMES:
-        if not dpg.get_value(_enabled_tag(name)):
+    for vid in _vids():
+        if not dpg.get_value(_enabled_tag(vid)):
             continue
-        cfg = state["voices"][name]
+        cfg = state["voices"][vid]
         if flat:
             _flatten_voice(cfg)
-        enabled.append((name, cfg))
+        enabled.append((vid, cfg))
 
     if not enabled:
         state["const"] = const
@@ -461,8 +612,8 @@ def _remix_current() -> None:
     vb = state["voice_buffers"]
     if not vb:
         return
-    buffers = [vb[n] * state["voice_vol"].get(n, 1.0)
-               for n in VOICE_NAMES if n in vb]
+    buffers = [vb[vid] * state["voice_vol"].get(vid, 1.0)
+               for vid in _vids() if vid in vb]
     mixed = synth.mix(buffers) if buffers else None
     with _buf_lock:
         old = state["mixed"]
@@ -485,8 +636,8 @@ def _on_voice_vol(sender, app_data, user_data) -> None:
     # Re-mixing drops the previously merged decay tail; let it re-merge next frame.
     nvb = state["next_voice_buffers"]
     if nvb and state["next_buf"] is not None:
-        buffers = [nvb[n] * state["voice_vol"].get(n, 1.0)
-                   for n in VOICE_NAMES if n in nvb]
+        buffers = [nvb[vid] * state["voice_vol"].get(vid, 1.0)
+                   for vid in _vids() if vid in nvb]
         state["next_buf"] = synth.mix(buffers) if buffers else None
         state["next_tail_merged"] = False
 
@@ -495,10 +646,10 @@ def _sync_volumes_from_widgets() -> None:
     """Pull slider values into state (set_value does not fire callbacks)."""
     if dpg.does_item_exist("master_vol"):
         state["master_vol"] = float(dpg.get_value("master_vol"))
-    for n in VOICE_NAMES:
-        tag = f"vol_{n}"
+    for vid in _vids():
+        tag = _vol_tag(vid)
         if dpg.does_item_exist(tag):
-            state["voice_vol"][n] = float(dpg.get_value(tag))
+            state["voice_vol"][vid] = float(dpg.get_value(tag))
 
 
 def on_play() -> None:
@@ -533,30 +684,58 @@ def on_export() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Persistence: remember every widget value between sessions.
+# Persistence: remember the session + the whole (dynamic) voice set.
 # --------------------------------------------------------------------------- #
-def _setting_tags():
-    """Every widget tag whose value is saved/restored/reset."""
+def _global_tags():
+    """Session-level widget tags (everything that isn't a per-voice control)."""
     tags = ["session_key", "session_scale", "session_seed_random", "session_flat",
             "session_live", "session_endless"]
     tags += [f"session_{n}" for n in SESSION_INT_FIELDS]
-    for name in VOICE_NAMES:
-        tags.append(_enabled_tag(name))
-        for f in dataclasses.fields(VoiceConfig):
-            if f.name != "name":
-                tags.append(_voice_tag(name, f.name))
     return tags
 
 
-def _volume_tags():
-    """Volume slider tags: saved/restored, but kept out of the live-mode change
-    snapshot so moving a fader re-mixes instantly without a re-render."""
-    return ["master_vol"] + [f"vol_{n}" for n in VOICE_NAMES]
+def _voice_snapshot_tags():
+    """Per-voice widget tags watched for live re-render. `name` and the volume
+    faders are deliberately excluded: renaming/refading must not force a render."""
+    tags = []
+    for vid in _vids():
+        tags.append(_enabled_tag(vid))
+        for f in dataclasses.fields(VoiceConfig):
+            if f.name != "name":
+                tags.append(_voice_tag(vid, f.name))
+    return tags
+
+
+def _sync_all_from_widgets() -> None:
+    """Pull every voice widget value (fields, name, enabled, volume) into state,
+    so a save reflects the current UI even outside live mode."""
+    _apply_voice_widgets()
+    _sync_volumes_from_widgets()
+    for vid in _vids():
+        cfg = state["voices"].get(vid)
+        if cfg is None:
+            continue
+        ntag, etag = _voice_tag(vid, "name"), _enabled_tag(vid)
+        if dpg.does_item_exist(ntag):
+            cfg.name = str(dpg.get_value(ntag))
+        if dpg.does_item_exist(etag):
+            state["voice_enabled"][vid] = bool(dpg.get_value(etag))
 
 
 def save_settings() -> None:
-    tags = _setting_tags() + _volume_tags()
-    data = {tag: dpg.get_value(tag) for tag in tags if dpg.does_item_exist(tag)}
+    _sync_all_from_widgets()
+    data = {tag: dpg.get_value(tag) for tag in _global_tags() if dpg.does_item_exist(tag)}
+    if dpg.does_item_exist("master_vol"):
+        data["master_vol"] = dpg.get_value("master_vol")
+    data["voices"] = [
+        {
+            "enabled": state["voice_enabled"].get(vid, True),
+            "vol": state["voice_vol"].get(vid, 1.0),
+            "color": list(_color_for(vid)),
+            "config": _voice_to_dict(state["voices"][vid]),
+        }
+        for vid in _vids()
+    ]
     try:
         with open(SETTINGS_PATH, "w") as fh:
             json.dump(data, fh, indent=2)
@@ -565,6 +744,8 @@ def save_settings() -> None:
 
 
 def load_settings() -> None:
+    """Restore session widgets and rebuild the voice set from disk (if present).
+    Rebuilds the voice panels, so must run after build_ui()."""
     if not os.path.exists(SETTINGS_PATH):
         return
     try:
@@ -573,18 +754,30 @@ def load_settings() -> None:
     except (OSError, ValueError) as exc:
         print(f"[gui] could not load settings: {exc}")
         return
-    for tag, val in data.items():
-        if dpg.does_item_exist(tag):
+
+    for tag in _global_tags() + ["master_vol"]:
+        if tag in data and dpg.does_item_exist(tag):
             try:
-                dpg.set_value(tag, val)
+                dpg.set_value(tag, data[tag])
             except Exception:
                 pass
 
+    voices = data.get("voices")
+    if isinstance(voices, list) and voices:
+        state["voices"], state["voice_order"] = {}, []
+        state["voice_enabled"], state["voice_vol"], state["voice_colors"] = {}, {}, {}
+        state["_next_vid"] = 0
+        for entry in voices:
+            cfg = _voice_from_dict(entry.get("config", {}))
+            color = tuple(entry["color"]) if entry.get("color") else None
+            _register_voice(cfg, enabled=bool(entry.get("enabled", True)),
+                            vol=float(entry.get("vol", 1.0)), color=color)
+        _rebuild_voice_panels()
+
 
 def _default_settings() -> dict:
-    """The value every widget should hold in its factory-default state."""
+    """Factory-default values for the session-level widgets."""
     const = SessionConstitution()
-    voices = default_voices()
     out = {
         "session_key": const.key,
         "session_scale": const.scale,
@@ -592,29 +785,27 @@ def _default_settings() -> dict:
         "session_flat": False,
         "session_live": True,
         "session_endless": True,
+        "master_vol": 1.0,
     }
-    for tag in _volume_tags():
-        out[tag] = 1.0
     for n in SESSION_INT_FIELDS:
         out[f"session_{n}"] = getattr(const, n)
-    for name in VOICE_NAMES:
-        out[_enabled_tag(name)] = True
-        cfg = voices[name]
-        for f in dataclasses.fields(VoiceConfig):
-            if f.name == "name":
-                continue
-            v = getattr(cfg, f.name)
-            out[_voice_tag(name, f.name)] = repr(v) if isinstance(v, tuple) else v
     return out
 
 
 def on_reset_defaults() -> None:
-    state["voices"] = default_voices()
+    _reset_voice_collection()
     for tag, val in _default_settings().items():
         if dpg.does_item_exist(tag):
             dpg.set_value(tag, val)
+    _rebuild_voice_panels()
     _sync_volumes_from_widgets()
-    _remix_current()
+    state["events"], state["voice_buffers"] = {}, {}
+    with _buf_lock:
+        state["mixed"] = None
+        state["play_sample"] = 0
+    _invalidate_next()
+    state["param_snapshot"] = _param_snapshot()
+    draw_piano_roll()
     _status("reset to defaults")
 
 
@@ -624,7 +815,7 @@ def on_reset_defaults() -> None:
 def _param_snapshot() -> dict:
     """Snapshot all controllable widget values for change detection."""
     return {tag: dpg.get_value(tag)
-            for tag in _setting_tags()
+            for tag in _global_tags() + _voice_snapshot_tags()
             if dpg.does_item_exist(tag)}
 
 
@@ -638,9 +829,9 @@ def _changed_voices(old_snap: dict, new_snap: dict):
         if new_snap.get(tag) == old_val:
             continue
         matched = None
-        for vname in VOICE_NAMES:
-            if tag.startswith(f"v_{vname}_"):
-                matched = vname
+        for vid in _vids():
+            if tag.startswith(f"v_{vid}_"):
+                matched = vid
                 break
         if matched is not None:
             changed.add(matched)
@@ -659,19 +850,19 @@ def _revoice_worker(names: set) -> None:
         events = state["events"]
 
         n_voices = len(names)
-        for idx, name in enumerate(names):
+        for idx, vid in enumerate(names):
             state["gen_progress"] = (idx + 1) / (n_voices + 1)
-            state["gen_status"] = f"updating {name}..."
-            if not dpg.get_value(_enabled_tag(name)):
-                voice_buffers.pop(name, None)
+            cfg = state["voices"].get(vid)
+            state["gen_status"] = f"updating {cfg.name if cfg else vid}..."
+            if cfg is None or not dpg.get_value(_enabled_tag(vid)):
+                voice_buffers.pop(vid, None)
                 continue
-            cfg = state["voices"][name]
-            evs = events.get(name, [])
+            evs = events.get(vid, [])
             if evs:
-                voice_buffers[name] = synth.render_events(evs, const, cfg)
+                voice_buffers[vid] = synth.render_events(evs, const, cfg)
 
-        buffers = [voice_buffers[n] * state["voice_vol"].get(n, 1.0)
-                   for n in VOICE_NAMES if n in voice_buffers]
+        buffers = [voice_buffers[vid] * state["voice_vol"].get(vid, 1.0)
+                   for vid in _vids() if vid in voice_buffers]
         mixed = synth.mix(buffers) if buffers else None
         state["gen_result"] = (const, events, voice_buffers, mixed)
     except Exception as exc:
@@ -685,12 +876,12 @@ def _endless_gen_worker(const, flat, enabled) -> None:
     try:
         arr = flat_arrangement(const) if flat else build_arrangement(const)
         events, voice_buffers, buffers = {}, {}, []
-        for name, cfg in enabled:
+        for vid, cfg in enabled:
             evs = generator.generate_voice(const, cfg, arr)
-            events[name] = evs
+            events[vid] = evs
             buf = synth.render_events(evs, const, cfg)
-            voice_buffers[name] = buf   # store unscaled; per-voice gain applied at mix
-            buffers.append(buf * state["voice_vol"].get(name, 1.0))
+            voice_buffers[vid] = buf   # store unscaled; per-voice gain applied at mix
+            buffers.append(buf * state["voice_vol"].get(vid, 1.0))
         mixed = synth.mix(buffers) if buffers else None
         # Publish metadata first, then next_buf last: the audio thread swaps on
         # next_buf, so everything it needs must already be in place when it sees it.
@@ -723,8 +914,8 @@ def _trigger_endless_preload() -> None:
         return
     next_const = dataclasses.replace(const, seed=random.randint(0, 2**31 - 1))
     flat = dpg.get_value("session_flat")
-    enabled = [(name, state["voices"][name]) for name in VOICE_NAMES
-               if dpg.get_value(_enabled_tag(name))]
+    enabled = [(vid, state["voices"][vid]) for vid in _vids()
+               if dpg.get_value(_enabled_tag(vid))]
     if not enabled:
         return
     state["endless_gen_running"] = True
@@ -827,12 +1018,12 @@ def draw_piano_roll(current_time: float | None = None) -> None:
 
     # Notes (current segment, plus chained next segment in scrolling mode).
     for evs, offset in segments:
-        for name in VOICE_NAMES:
-            if name not in evs:
+        for vid in _vids():
+            if vid not in evs:
                 continue
-            color = VOICE_COLORS[name]
-            cfg = state["voices"][name]
-            for ev in evs[name]:
+            color = _color_for(vid)
+            cfg = state["voices"][vid]
+            for ev in evs[vid]:
                 vis = max(0.08, ev.duration - cfg.decay)
                 n_start = ev.start + offset
                 n_end   = min(ev.start + vis, total_secs) + offset
@@ -849,14 +1040,16 @@ def draw_piano_roll(current_time: float | None = None) -> None:
         dpg.draw_line((px, plot_y0), (px, plot_y0 + plot_h),
                       color=(255, 70, 70), thickness=2, parent="piano_roll")
 
-    # Legend.
-    for i, name in enumerate(VOICE_NAMES):
-        on = dpg.get_value(_enabled_tag(name))
-        c = VOICE_COLORS[name] if (name in events) else (90, 90, 90)
-        lx = plot_x0 + 12 + i * 120
-        dpg.draw_rectangle((lx, plot_y0 + 8), (lx + 14, plot_y0 + 22),
+    # Legend (wraps to a second row if there are many voices).
+    for i, vid in enumerate(_vids()):
+        cfg = state["voices"][vid]
+        on = state["voice_enabled"].get(vid, True)
+        c = _color_for(vid) if (vid in events) else (90, 90, 90)
+        lx = plot_x0 + 12 + (i % 6) * 120
+        ly = plot_y0 + 8 + (i // 6) * 22
+        dpg.draw_rectangle((lx, ly), (lx + 14, ly + 14),
                            fill=c, color=c, parent="piano_roll")
-        dpg.draw_text((lx + 20, plot_y0 + 7), name if on else f"{name} (off)",
+        dpg.draw_text((lx + 20, ly - 1), cfg.name if on else f"{cfg.name} (off)",
                       size=14, color=(200, 200, 200), parent="piano_roll")
 
 
@@ -1028,25 +1221,135 @@ def _build_session_controls() -> None:
         _tip("session_flat", SESSION_HELP["flat"])
 
 
-def _build_voice_controls(name: str) -> None:
-    cfg = state["voices"][name]
-    with dpg.group(horizontal=True):
-        dpg.add_checkbox(tag=_enabled_tag(name), default_value=True)
-        _tip(_enabled_tag(name), VOICE_ENABLED_HELP)
-        dpg.add_slider_float(tag=f"vol_{name}", default_value=1.0,
-                             min_value=0.0, max_value=1.0, width=90, format="%.2f",
-                             callback=_on_voice_vol, user_data=name)
-        _tip(f"vol_{name}",
-             f"Loudness of the {name} voice in the mix. Takes effect instantly "
-             "without re-rendering. 0 = silent, 1 = full.")
-        with dpg.collapsing_header(label=name):
+# --- per-voice control callbacks --------------------------------------------
+def _on_enabled(sender, app_data, user_data) -> None:
+    state["voice_enabled"][user_data] = bool(app_data)
+    if not state["playing"]:
+        draw_piano_roll()  # refresh the legend's on/off label
+
+
+def _on_rename(sender, app_data, user_data) -> None:
+    vid = user_data
+    cfg = state["voices"].get(vid)
+    if cfg is None:
+        return
+    cfg.name = str(app_data)
+    htag = _voice_tag(vid, "header")
+    if dpg.does_item_exist(htag):
+        dpg.configure_item(htag, label=cfg.name or "(unnamed)")
+    if not state["playing"]:
+        draw_piano_roll()  # rename shows in the legend; no re-render needed
+
+
+def on_add_voice() -> None:
+    _apply_voice_widgets()               # preserve edits in the other panels
+    vid = _register_voice(_new_blank_voice())
+    _rebuild_voice_panels()
+    state["param_snapshot"] = _param_snapshot()
+    if not state["playing"]:
+        draw_piano_roll()
+    _status(f"added voice '{state['voices'][vid].name}' -- press Generate to hear it")
+
+
+def on_delete_voice(sender, app_data, user_data) -> None:
+    vid = user_data
+    _apply_voice_widgets()               # preserve edits in the surviving panels
+    name = state["voices"].get(vid).name if vid in state["voices"] else vid
+    _forget_voice(vid)
+    _rebuild_voice_panels()
+    _remix_current()                     # drop its audio from the live mix now
+    _invalidate_next()
+    state["param_snapshot"] = _param_snapshot()
+    draw_piano_roll()
+    _status(f"deleted voice '{name}'")
+
+
+def on_save_voice(sender, app_data, user_data) -> None:
+    vid = user_data
+    _apply_voice_widgets()
+    cfg = state["voices"].get(vid)
+    if cfg is None:
+        return
+    ntag = _voice_tag(vid, "name")
+    if dpg.does_item_exist(ntag):
+        cfg.name = str(dpg.get_value(ntag))
+    try:
+        os.makedirs(VOICES_DIR, exist_ok=True)
+        path = _library_path(cfg.name)
+        with open(path, "w") as fh:
+            json.dump(_voice_to_dict(cfg), fh, indent=2)
+    except OSError as exc:
+        _status(f"could not save voice: {exc}")
+        return
+    _refresh_library_combo()
+    _status(f"saved voice to {os.path.relpath(path, _HERE)}")
+
+
+def on_add_from_library() -> None:
+    name = dpg.get_value("library_combo")
+    if not name:
+        _status("pick a saved voice from the list first")
+        return
+    path = _library_path(name)
+    try:
+        with open(path) as fh:
+            cfg = _voice_from_dict(json.load(fh))
+    except (OSError, ValueError) as exc:
+        _status(f"could not load voice: {exc}")
+        return
+    _apply_voice_widgets()
+    cfg.name = _unique_name(cfg.name)
+    vid = _register_voice(cfg)
+    _rebuild_voice_panels()
+    state["param_snapshot"] = _param_snapshot()
+    if not state["playing"]:
+        draw_piano_roll()
+    _status(f"added '{cfg.name}' from library -- press Generate to hear it")
+
+
+def _refresh_library_combo() -> None:
+    if dpg.does_item_exist("library_combo"):
+        dpg.configure_item("library_combo", items=library_voices())
+
+
+# --- per-voice panel builder ------------------------------------------------
+def _build_voice_panel(vid: str) -> None:
+    """Build one voice's control panel as a child of the 'voices_panel' group."""
+    cfg = state["voices"][vid]
+    with dpg.group(parent="voices_panel"):
+        with dpg.group(horizontal=True):
+            dpg.add_checkbox(tag=_enabled_tag(vid),
+                             default_value=state["voice_enabled"].get(vid, True),
+                             callback=_on_enabled, user_data=vid)
+            _tip(_enabled_tag(vid), VOICE_ENABLED_HELP)
+            dpg.add_slider_float(tag=_vol_tag(vid),
+                                 default_value=state["voice_vol"].get(vid, 1.0),
+                                 min_value=0.0, max_value=1.0, width=80, format="%.2f",
+                                 callback=_on_voice_vol, user_data=vid)
+            _tip(_vol_tag(vid),
+                 "Loudness of this voice in the mix. Takes effect instantly "
+                 "without re-rendering. 0 = silent, 1 = full.")
+            dpg.add_input_text(tag=_voice_tag(vid, "name"), default_value=cfg.name,
+                               width=100, callback=_on_rename, user_data=vid)
+            _tip(_voice_tag(vid, "name"),
+                 "This voice's name -- edit freely; it only relabels the voice "
+                 "(shown in the piano-roll legend) and doesn't change the sound.")
+            dpg.add_button(label="Save", width=42, callback=on_save_voice, user_data=vid)
+            _tip(dpg.last_item(), "Save this voice to the reusable library (voices/).")
+            dpg.add_button(label="Del", width=38, callback=on_delete_voice, user_data=vid)
+            _tip(dpg.last_item(), "Remove this voice from the session.")
+        with dpg.collapsing_header(label=cfg.name or "(unnamed)",
+                                   tag=_voice_tag(vid, "header")):
             for f in dataclasses.fields(VoiceConfig):
                 if f.name == "name":
                     continue
                 val = getattr(cfg, f.name)
-                tag = _voice_tag(name, f.name)
+                tag = _voice_tag(vid, f.name)
                 if isinstance(val, tuple):
                     dpg.add_input_text(label=f.name, default_value=repr(val), tag=tag, width=180)
+                elif f.name == "role":
+                    dpg.add_combo(list(GENERATOR_ROLES), label=f.name, default_value=val,
+                                  tag=tag, width=180)
                 elif f.name == "vowel":
                     dpg.add_combo(list(VOWEL_FORMANTS), label=f.name, default_value=val,
                                   tag=tag, width=180)
@@ -1060,6 +1363,17 @@ def _build_voice_controls(name: str) -> None:
                 else:
                     dpg.add_input_text(label=f.name, default_value=str(val), tag=tag, width=180)
                 _tip(tag, VOICE_HELP.get(f.name, f.name))
+        dpg.add_separator()
+
+
+def _rebuild_voice_panels() -> None:
+    """Tear down and rebuild every voice panel from state (after add/delete/load).
+    State is the source of truth; widgets are recreated from it."""
+    if not dpg.does_item_exist("voices_panel"):
+        return
+    dpg.delete_item("voices_panel", children_only=True)
+    for vid in _vids():
+        _build_voice_panel(vid)
 
 
 def build_ui() -> None:
@@ -1068,8 +1382,20 @@ def build_ui() -> None:
             # left: controls
             with dpg.child_window(width=400, autosize_y=True):
                 _build_session_controls()
-                for name in VOICE_NAMES:
-                    _build_voice_controls(name)
+                dpg.add_separator()
+                dpg.add_text("Voices")
+                dpg.add_group(tag="voices_panel")
+                _rebuild_voice_panels()
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="Add Voice", callback=on_add_voice, width=90)
+                    _tip(dpg.last_item(),
+                         "Add a new blank voice to the session. Edit its knobs, then "
+                         "press Generate to hear it.")
+                    dpg.add_combo([], tag="library_combo", width=130)
+                    _tip("library_combo", "Voices you've saved to the library (voices/).")
+                    dpg.add_button(label="Add Saved", callback=on_add_from_library, width=80)
+                    _tip(dpg.last_item(),
+                         "Add the voice picked in the list to the current session.")
             # right: transport + piano roll
             with dpg.child_window(width=-1, autosize_y=True):
                 with dpg.group(horizontal=True):
@@ -1113,6 +1439,7 @@ def main() -> None:
     dpg.set_primary_window("primary", True)
     load_settings()
     _sync_volumes_from_widgets()
+    _refresh_library_combo()
     draw_piano_roll()
     while dpg.is_dearpygui_running():
         frame_update()

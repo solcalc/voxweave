@@ -1,19 +1,25 @@
 # voxweave
 
 A Python engine for generating harmonized, seed-reproducible ambient music from
-four synchronized vocal-formant voices. Built as a testbed for an algorithm that
-will eventually run on ESP32-WROOM-32U hardware (ESP-IDF + MAX98357A I2S) —
+a set of synchronized vocal-formant voices. Built as a testbed for an algorithm
+that will eventually run on ESP32-WROOM-32U hardware (ESP-IDF + MAX98357A I2S) —
 iterate here, listen, then port to C.
 
 ## Concept
 
-Four synchronized "doll" voices derive from one shared **constitution**
-(root key, scale, tempo, seed) so they stay harmonized:
+Every "doll" voice derives from one shared **constitution** (root key, scale,
+tempo, seed) so they stay harmonized. Each voice has a **role** that selects how
+its notes are written — the default session ships with four:
 
 - **melody** — random walk across scale degrees, sparse rhythm, upper register, vowel `ee`
 - **harmony** — its own independent random walk on the same key/scale, mid register, sparser, vowel `oh`
 - **drone** — sustains one scale degree, changes every 8–16 bars, low register, vowel `oo`
 - **beat** — a beatboxer: vocal-sounding kick/snare/hat/open-hat/clap/rim/tom hits on a sixteenth grid, shaped by "mouth" formants. Morphs between groove variants, sprinkles humanized ghost notes, and drops random fills (and always fills into a cadence), so it never loops literally
+
+A voice's `role` (the generation algorithm) is separate from its `name` (a
+free-form label), so voices can be renamed, added, removed, or saved without
+changing how their notes are produced — the GUI drives all of this, and multiple
+voices can share a role (e.g. two `melody` lines) while keeping distinct names.
 
 Each voice is a self-contained musical line (auditions well alone) yet stays in
 key with the others because they share the constitution. Every walking voice is
@@ -30,7 +36,7 @@ cookbook) → ADSR envelope → mix.
 |----------------|-----------------|------|
 | `prng.py`      | none            | portable xorshift32 PRNG (matches on-device C) |
 | `scales.py`    | none            | scale semitone tables, MIDI/Hz helpers |
-| `config.py`    | none            | `SessionConstitution`, `VoiceConfig`, vowel formant table |
+| `config.py`    | none            | `SessionConstitution`, `VoiceConfig` (incl. `role`), vowel formant table |
 | `generator.py` | prng/scales/config | note-event generation — **no audio deps** |
 | `synth.py`     | numpy           | oscillator, biquad, ADSR, formant, mix — **numpy only** |
 | `wav_io.py`    | stdlib wave / sounddevice | WAV write + optional playback |
@@ -85,6 +91,25 @@ time, one colour per voice). **Play**/**Stop** audition the mix (via sounddevice
 **Export WAV** writes to `output/`. It calls `generate_voice` / `render_events` /
 `mix` directly, so an untouched render is byte-identical to the equivalent
 `testbed.py` run.
+
+### Managing voices
+
+The voice set is fully dynamic — you're not limited to the default four:
+
+- **Rename** — edit a voice's name field; it relabels the voice (and its piano-roll
+  legend) without changing the sound. The `role` dropdown is what picks the
+  generation algorithm, so renaming is purely cosmetic.
+- **Add / delete** — **Add Voice** appends a fresh sung voice; each panel's **Del**
+  removes one. New/removed voices drop into and out of the live mix immediately.
+- **Save / load a library** — a panel's **Save** button writes that voice to
+  `voices/<name>.json`; pick a saved voice from the dropdown and **Add Saved** to
+  drop it into the current session (duplicate names are auto-suffixed, e.g.
+  `sparkle 2`). The `voices/` library is user data and is git-ignored.
+
+Changing a voice's `role` (or any note-generating knob) takes full effect on the
+next **Generate**; volume, vowel, and the other synth-time knobs update live. The
+whole voice set — names, roles, enabled flags, and every parameter — is persisted
+to `gui_settings.json` between sessions.
 
 ## Reproducibility
 
