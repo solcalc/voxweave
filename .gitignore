@@ -16,5 +16,8 @@ output_flat/
 # Saved voice library (user data)
 voices/
 
+# Temporary / scratch work
+tmp/
+
 # OS / editor
 .DS_Store
